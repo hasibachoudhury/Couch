@@ -1,0 +1,126 @@
+#!/usr/bin/env python
+
+import requests
+import git
+import os
+import shutil
+import re
+from git import Repo
+import tarfile
+import sys
+
+
+#URL = "https://raw.githubusercontent.com/couchbase/sync_gateway/master/manifest/default.xml"
+#TARGET_DIR = 'target-zipfile'
+
+# Removes the directory, forcefully if force is set to True, else ask for user's permission
+def removeDirectory(dir, force):
+	if os.path.isdir(dir):
+		if force or input("Directory %s already exists. Delete it (y/n)? " % os.path.abspath(dir)) in ["y", "Y"]:
+				shutil.rmtree(dir)
+		else:
+			print ("Delete the directory manually or run the script with a different target directory")
+			exit()
+
+# Downloads the file from the url
+def getManifest(url, directory):
+	local_filename = url.split('/')[-1]
+	r = requests.get(url, stream=True)
+
+	filepath = directory + "/" + local_filename
+	with open(filepath, 'wb') as f:
+		for chunk in r.iter_content(chunk_size=1024):
+			if chunk: # filter out keep-alive new chunks
+				f.write(chunk)
+	f.close()
+	return filepath
+
+def fetchAllRepoDetails(url, directory):
+	#fetch all repos and put that in a dict as repo: rev
+	filepath = getManifest(url, directory)
+
+	remoteToUrlDict = {}
+	projectDict = {}
+
+	# Regex for remotes
+	remote_url_regex = re.compile(r'remote fetch="(.*?)"')
+	name_regex = re.compile(r'name="(.*?)"')
+	remote_regex = re.compile(r'remote="(.*?)"')
+	rev_regex = re.compile(r'revision="(.*?)"')
+	path_regex = re.compile(r'path="(.*?)"')
+
+	with open(filepath, 'r') as f:
+		for line in f:
+			remote_url_match = remote_url_regex.search(line)
+			if remote_url_match is not None:
+				git_url = remote_url_match.group(1)
+				git_url = git_url.replace("ssh://git@", "https://")
+
+				remote_name_match = name_regex.search(line)
+				if remote_name_match is not None:
+					remote_name = remote_name_match.group(1)
+					remoteToUrlDict[remote_name] = git_url
+			else:
+				remote_match = re.search(remote_regex, line)
+				name_match = re.search(name_regex, line)
+
+				if remote_match is not None and name_match is not None:
+					git_url = remoteToUrlDict[remote_match.group(1)] + name_match.group(1)
+
+					revision = "master"
+					rev_match = rev_regex.search(line)
+					if rev_match is not None:
+						revision = rev_match.group(1)
+
+					path = "."
+					path_match = path_regex.search(line)
+					if path_match is not None:
+						path = path_match.group(1)
+					projectDict[git_url] = (revision, path)
+	f.close()
+	return projectDict
+
+def cloneGitRevision(url, path, revision = None):
+	#print ("URL:", url, " Revision:", revision)
+	repo = Repo.clone_from(url, path)
+	if revision is not None:
+		repo.head.reset(revision, working_tree = True)
+
+#git clone the repo's using rev
+def gitClone(url, source_dir):
+	projectDict = fetchAllRepoDetails(url, source_dir)
+
+	for git_url in projectDict:
+		if requests.get(git_url).status_code != 200:
+			print("WARNING: Repo " + git_url + " doesn't exist, proceeding to next Repo")
+		else:
+			if projectDict[git_url][0] == "master":
+				print("WARNING: revision not specified for " + git_url)
+				print("Starting Git Clone of Repo: " + git_url)
+				cloneGitRevision(git_url, source_dir + "/" + projectDict[git_url][1])
+			else:
+				print("Starting Git Clone of Repo: " + git_url)
+				cloneGitRevision(git_url, source_dir + "/" + projectDict[git_url][1], projectDict[git_url][0])
+
+def createTar(url, source_dir):
+	removeDirectory(source_dir, False)
+	os.makedirs(source_dir, exist_ok=True)
+	gitClone(url, source_dir)
+
+	with tarfile.open(source_dir + '.tar.gz', mode='w:gz') as archive:
+		archive.add(source_dir, recursive=True)
+
+	removeDirectory(source_dir, True)
+	print("%s.tar.gz is created" %source_dir)
+
+def printUsage():
+	print("usage: ./couchbase.py <url> <filename>")
+
+if __name__ == "__main__":
+	if len(sys.argv) == 2 and sys.argv[1] in ["--help", "-?"]:
+		printUsage()
+	elif len(sys.argv) != 3:
+		print ("Incorrect number of arguments!")
+		printUsage()
+	else:
+		createTar(sys.argv[1], sys.argv[2])
